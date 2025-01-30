@@ -29,7 +29,14 @@ public class URLSessionInstrumentation {
 
     static var instrumentedKey = "io.opentelemetry.instrumentedCall"
 
-    static let avAssetDownloadTask: AnyClass? = NSClassFromString("__NSCFBackgroundAVAssetDownloadTask")
+    static let AVTaskClassList: [AnyClass] = {
+      [
+        "__NSCFBackgroundAVAggregateAssetDownloadTask",
+        "__NSCFBackgroundAVAssetDownloadTask",
+        "__NSCFBackgroundAVAggregateAssetDownloadTaskNoChildTask"
+      ]
+      .compactMap { NSClassFromString($0) }
+    }()
 
     public private(set) var tracer: Tracer
 
@@ -157,6 +164,12 @@ public class URLSessionInstrumentation {
                     }
                 }
                 self.setIdKey(value: sessionTaskId, for: task)
+                
+                // We want to identify background tasks
+                if session.configuration.identifier != nil {
+                    objc_setAssociatedObject(
+                        task, "IsBackground", true, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+                }
                 return task
             }
             let swizzledIMP = imp_implementationWithBlock(unsafeBitCast(block, to: AnyObject.self))
@@ -183,6 +196,13 @@ public class URLSessionInstrumentation {
                 let instrumentedRequest = URLSessionLogger.processAndLogRequest(request, sessionTaskId: sessionTaskId, instrumentation: self, shouldInjectHeaders: true)
                 let task = castedIMP(session, selector, instrumentedRequest ?? request, argument)
                 self.setIdKey(value: sessionTaskId, for: task)
+                
+                // We want to identify background tasks
+                if session.configuration.identifier != nil {
+                    objc_setAssociatedObject(
+                        task, "IsBackground", true, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+                }
+                
                 return task
             }
             let swizzledIMP = imp_implementationWithBlock(unsafeBitCast(block, to: AnyObject.self))
@@ -582,11 +602,19 @@ public class URLSessionInstrumentation {
 
     private func urlSessionTaskWillResume(_ task: URLSessionTask) {
         // AV Asset Tasks cannot be auto instrumented, they dont include request attributes, skip them
-        if let avAssetTaskClass = Self.avAssetDownloadTask,
-           task.isKind(of: avAssetTaskClass) {
+        guard !Self.AVTaskClassList.contains(where: { task.isKind(of: $0) }) else {
             return
         }
-
+        
+        // We cannot instrument async background tasks because they crash if you assign a delegate
+        if #available(OSX 13.0, iOS 16.0, watchOS 9.0, tvOS 16.0, *) {
+            if objc_getAssociatedObject(task, "IsBackground") is Bool {
+                guard Task.basePriority == nil else {
+                    return
+                }
+            }
+        }
+        
         let taskId = idKeyForTask(task)
         if let request = task.currentRequest {
             queue.sync {
